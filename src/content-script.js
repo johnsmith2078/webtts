@@ -141,12 +141,18 @@
     }
 
     const range = selection.getRangeAt(0);
-    const rect = range.getBoundingClientRect();
+    const rects = range.getClientRects();
+    const anchorRect =
+      rects.length > 0 ? rects[rects.length - 1] : range.getBoundingClientRect();
 
     const viewportWidth = document.documentElement.clientWidth;
     const viewportHeight = document.documentElement.clientHeight;
-    const clampedLeft = Math.min(Math.max(rect.left + rect.width / 2, 8), viewportWidth - 44);
-    const clampedTop = Math.min(Math.max(rect.top - 44, 8), viewportHeight - 44);
+    const buttonSize = 36;
+    const margin = 8;
+    const desiredLeft = anchorRect.right + margin;
+    const desiredTop = anchorRect.top + anchorRect.height / 2 - buttonSize / 2;
+    const clampedLeft = Math.min(Math.max(desiredLeft, margin), viewportWidth - buttonSize - margin);
+    const clampedTop = Math.min(Math.max(desiredTop, margin), viewportHeight - buttonSize - margin);
 
     state.currentText = text;
     button.style.left = `${clampedLeft}px`;
