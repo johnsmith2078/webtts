@@ -64,14 +64,254 @@
 
   let hideTimer = null;
 
-  function detectLanguage(text) {
-    const trimmed = text.trim();
-    if (!trimmed) return navigator.language || "en-US";
-    const hasCJK = /[\u4e00-\u9fff]/.test(trimmed);
-    const hasCyrillic = /[\u0400-\u04FF]/.test(trimmed);
-    if (hasCJK) return "zh-CN";
-    if (hasCyrillic) return "ru-RU";
-    return navigator.language || "en-US";
+  const DEFAULT_FALLBACK_LOCALE = "en-US";
+  const DEFAULT_FALLBACK_VOICE = "en-US, AriaNeural";
+
+  // Some legacy/alias language tags that may appear in detectors/user agents.
+  const LANGUAGE_ALIASES = {
+    in: "id",
+    iw: "he",
+    ji: "yi",
+    jw: "jv",
+    no: "nb",
+    tl: "fil"
+  };
+
+  // When a base language maps to multiple locales, prefer a commonly used default.
+  const DEFAULT_LOCALE_BY_LANGUAGE = {
+    ar: "ar-SA",
+    da: "da-DK",
+    de: "de-DE",
+    el: "el-GR",
+    en: "en-US",
+    es: "es-ES",
+    fa: "fa-IR",
+    fi: "fi-FI",
+    fr: "fr-FR",
+    he: "he-IL",
+    hi: "hi-IN",
+    id: "id-ID",
+    it: "it-IT",
+    ja: "ja-JP",
+    ko: "ko-KR",
+    nb: "nb-NO",
+    nl: "nl-NL",
+    pt: "pt-BR",
+    ru: "ru-RU",
+    sv: "sv-SE",
+    th: "th-TH",
+    tr: "tr-TR",
+    uk: "uk-UA",
+    vi: "vi-VN",
+    zh: "zh-CN"
+  };
+
+  // Keep the old defaults stable for common locales.
+  const PREFERRED_VOICE_BY_LOCALE = {
+    "en-us": "en-US, AriaNeural",
+    "zh-cn": "zh-CN, XiaoxiaoNeural",
+    "ru-ru": "ru-RU, SvetlanaNeural"
+  };
+
+  let voiceIndexPromise = null;
+
+  async function getVoiceIndex() {
+    if (voiceIndexPromise) return voiceIndexPromise;
+    voiceIndexPromise = (async () => {
+      if (!chrome?.runtime?.getURL) throw new Error("chrome.runtime.getURL unavailable");
+      const url = chrome.runtime.getURL("src/voice_list.tsv");
+      const tsv = await fetch(url).then((r) => r.text());
+
+      const localeToVoices = new Map(); // "en-US" -> ["en-US, AriaNeural", ...]
+      const languageNameToVoices = new Map(); // "English(United States)" -> ["en-US, ...", ...]
+      const lowerLocaleToCanonical = new Map(); // "en-us" -> "en-US"
+      const baseLangToLocales = new Map(); // "en" -> ["en-US", "en-GB", ...]
+
+      tsv.split(/\r?\n/).forEach((line) => {
+        if (!line.trim()) return;
+        const fields = line.split("\t");
+        if (fields.length < 3) return;
+
+        const languageName = fields[0].trim();
+        const code = fields[2].trim();
+        if (!code) return;
+
+        const locale = code.split(",")[0].trim();
+        if (!locale) return;
+
+        const localeLower = locale.toLowerCase();
+        if (!lowerLocaleToCanonical.has(localeLower)) lowerLocaleToCanonical.set(localeLower, locale);
+
+        if (!localeToVoices.has(locale)) localeToVoices.set(locale, []);
+        localeToVoices.get(locale).push(code);
+
+        if (!languageNameToVoices.has(languageName)) languageNameToVoices.set(languageName, []);
+        languageNameToVoices.get(languageName).push(code);
+
+        const base = localeLower.split("-")[0];
+        if (!base) return;
+        if (!baseLangToLocales.has(base)) baseLangToLocales.set(base, []);
+        const list = baseLangToLocales.get(base);
+        if (!list.includes(locale)) list.push(locale);
+      });
+
+      return { localeToVoices, languageNameToVoices, lowerLocaleToCanonical, baseLangToLocales };
+    })();
+    return voiceIndexPromise;
+  }
+
+  function normalizeLanguageTag(tag) {
+    const raw = String(tag || "").trim();
+    if (!raw) return "";
+
+    const lower = raw.toLowerCase();
+
+    // Common script tags returned by some detectors.
+    if (lower === "zh-hans") return "zh-CN";
+    if (lower === "zh-hant") return "zh-TW";
+
+    const parts = lower.split("-");
+    const base = LANGUAGE_ALIASES[parts[0]] || parts[0];
+    if (parts.length === 1) return base;
+    return [base, ...parts.slice(1)].join("-");
+  }
+
+  function getNavigatorLocales() {
+    const locales = [];
+    if (Array.isArray(navigator.languages)) locales.push(...navigator.languages);
+    if (navigator.language) locales.push(navigator.language);
+    return Array.from(new Set(locales.filter(Boolean)));
+  }
+
+  function resolveLocaleFromTag(tag, voiceIndex) {
+    const normalized = normalizeLanguageTag(tag);
+    if (!normalized) return "";
+
+    const lower = normalized.toLowerCase();
+    if (voiceIndex?.lowerLocaleToCanonical && lower.includes("-")) {
+      const direct = voiceIndex.lowerLocaleToCanonical.get(lower);
+      if (direct) return direct;
+    }
+
+    const base = lower.split("-")[0];
+    if (!base) return "";
+
+    // Prefer user's locale if it matches the detected base language and is available.
+    if (voiceIndex?.lowerLocaleToCanonical) {
+      for (const navLocale of getNavigatorLocales()) {
+        const navNormalized = normalizeLanguageTag(navLocale);
+        if (!navNormalized) continue;
+        const navLower = navNormalized.toLowerCase();
+        if (navLower.split("-")[0] !== base) continue;
+        const candidate = voiceIndex.lowerLocaleToCanonical.get(navLower);
+        if (candidate) return candidate;
+      }
+    }
+
+    const defaultLocale = DEFAULT_LOCALE_BY_LANGUAGE[base];
+    if (defaultLocale) {
+      if (voiceIndex?.lowerLocaleToCanonical) {
+        const candidate = voiceIndex.lowerLocaleToCanonical.get(defaultLocale.toLowerCase());
+        if (candidate) return candidate;
+      }
+      return defaultLocale;
+    }
+
+    if (voiceIndex?.baseLangToLocales) {
+      const locales = voiceIndex.baseLangToLocales.get(base);
+      if (Array.isArray(locales) && locales.length) return locales[0];
+    }
+
+    // Last resort: return base language, which is still a valid BCP-47 tag.
+    return base;
+  }
+
+  function guessLanguageTagByScript(text) {
+    const s = String(text || "");
+    if (/[\u3040-\u30ff\uff66-\uff9d]/.test(s)) return "ja";
+    if (/[\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]/.test(s)) return "ko";
+    if (/[\u4e00-\u9fff]/.test(s)) return "zh";
+    if (/[\u0400-\u04ff]/.test(s)) return "ru";
+    if (/[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]/.test(s)) return "ar";
+    if (/[\u0590-\u05ff]/.test(s)) return "he";
+    if (/[\u0900-\u097f]/.test(s)) return "hi";
+    if (/[\u0980-\u09ff]/.test(s)) return "bn";
+    if (/[\u0b80-\u0bff]/.test(s)) return "ta";
+    if (/[\u0e00-\u0e7f]/.test(s)) return "th";
+    return "";
+  }
+
+  function detectLanguageWithChrome(text) {
+    return new Promise((resolve) => {
+      const detector = chrome?.i18n?.detectLanguage;
+      if (typeof detector !== "function") {
+        resolve("");
+        return;
+      }
+
+      // Avoid huge inputs; Chrome's detector works fine on a prefix.
+      const sample = String(text || "").slice(0, 2000);
+      detector(sample, (result) => {
+        if (chrome?.runtime?.lastError) {
+          resolve("");
+          return;
+        }
+        const languages = result?.languages;
+        if (!Array.isArray(languages) || !languages.length) {
+          resolve("");
+          return;
+        }
+
+        let best = null;
+        for (const item of languages) {
+          if (!item || !item.language || item.language === "und") continue;
+          if (!best || (Number(item.percentage) || 0) > (Number(best.percentage) || 0)) {
+            best = item;
+          }
+        }
+        resolve(best?.language || "");
+      });
+    });
+  }
+
+  async function detectLanguage(text) {
+    const trimmed = String(text || "").trim();
+
+    let voiceIndex = null;
+    try {
+      voiceIndex = await getVoiceIndex();
+    } catch (_) {
+      voiceIndex = null;
+    }
+
+    const navLocale =
+      resolveLocaleFromTag(navigator.language || DEFAULT_FALLBACK_LOCALE, voiceIndex) ||
+      navigator.language ||
+      DEFAULT_FALLBACK_LOCALE;
+
+    if (!trimmed) return navLocale;
+
+    const chromeTag = await detectLanguageWithChrome(trimmed);
+    const guessedTag = chromeTag || guessLanguageTagByScript(trimmed) || navLocale;
+
+    return resolveLocaleFromTag(guessedTag, voiceIndex) || navLocale;
+  }
+
+  async function pickVoiceForLanguageName(languageName) {
+    let voiceIndex = null;
+    try {
+      voiceIndex = await getVoiceIndex();
+    } catch (_) {
+      return { lang: DEFAULT_FALLBACK_LOCALE, voice: DEFAULT_FALLBACK_VOICE };
+    }
+
+    const voices = voiceIndex.languageNameToVoices.get(languageName) || [];
+    if (!voices.length) return { lang: DEFAULT_FALLBACK_LOCALE, voice: DEFAULT_FALLBACK_VOICE };
+
+    const locale = voices[0].split(",")[0].trim();
+    const preferred = PREFERRED_VOICE_BY_LOCALE[String(locale).toLowerCase()];
+    const voice = preferred && voices.includes(preferred) ? preferred : voices[0];
+    return { lang: locale || DEFAULT_FALLBACK_LOCALE, voice };
   }
 
   // --- Edge TTS implementation (ported from edge-tts-gui/src/communicate.cpp) ---
@@ -185,11 +425,31 @@
     return headers;
   }
 
-  function pickVoiceForLang(lang) {
-    const lower = (lang || "").toLowerCase();
-    if (lower.startsWith("zh")) return "zh-CN, XiaoxiaoNeural";
-    if (lower.startsWith("ru")) return "ru-RU, SvetlanaNeural";
-    return "en-US, AriaNeural";
+  async function pickVoiceForLang(langOrTag) {
+    const lower = (langOrTag || "").toLowerCase();
+    const legacyFallback = lower.startsWith("zh")
+      ? "zh-CN, XiaoxiaoNeural"
+      : lower.startsWith("ru")
+        ? "ru-RU, SvetlanaNeural"
+        : DEFAULT_FALLBACK_VOICE;
+
+    let voiceIndex = null;
+    try {
+      voiceIndex = await getVoiceIndex();
+    } catch (_) {
+      return legacyFallback;
+    }
+
+    const locale = resolveLocaleFromTag(langOrTag, voiceIndex);
+    const canonical =
+      (locale && voiceIndex.lowerLocaleToCanonical.get(String(locale).toLowerCase())) || locale;
+    const voices = (canonical && voiceIndex.localeToVoices.get(canonical)) || [];
+    if (!voices.length) return legacyFallback;
+
+    const preferred = PREFERRED_VOICE_BY_LOCALE[String(canonical).toLowerCase()];
+    if (preferred && voices.includes(preferred)) return preferred;
+
+    return voices[0];
   }
 
   function formatSignedPercent(value) {
@@ -205,11 +465,12 @@
   function getUserSettings() {
     return new Promise((resolve) => {
       if (!chrome?.storage?.sync) {
-        resolve({ voiceCode: "auto", ratePercent: 0, volumePercent: 0, pitchHz: 0 });
+        resolve({ languageName: "__auto__", voiceCode: "auto", ratePercent: 0, volumePercent: 0, pitchHz: 0 });
         return;
       }
       chrome.storage.sync.get(
         {
+          languageName: "__auto__",
           voiceCode: "auto",
           ratePercent: 0,
           volumePercent: 0,
@@ -422,13 +683,21 @@
     if (!text) return;
 
     const settings = await getUserSettings();
-    const detectedLang = detectLanguage(text);
-    let lang = detectedLang;
-    let voice = pickVoiceForLang(detectedLang);
+
+    let lang = "";
+    let voice = "";
+
     if (settings.voiceCode && settings.voiceCode !== "auto") {
       voice = settings.voiceCode;
       const locale = voice.split(",")[0];
-      if (locale) lang = locale.trim();
+      lang = (locale && locale.trim()) || navigator.language || DEFAULT_FALLBACK_LOCALE;
+    } else if (settings.languageName && settings.languageName !== "__auto__") {
+      const picked = await pickVoiceForLanguageName(settings.languageName);
+      lang = picked.lang;
+      voice = picked.voice;
+    } else {
+      lang = await detectLanguage(text);
+      voice = await pickVoiceForLang(lang);
     }
 
     const session = new EdgeTtsSession(text, {
