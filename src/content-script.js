@@ -192,6 +192,34 @@
     return "en-US, AriaNeural";
   }
 
+  function formatSignedPercent(value) {
+    const num = Number(value) || 0;
+    return num >= 0 ? `+${num}%` : `${num}%`;
+  }
+
+  function formatSignedHz(value) {
+    const num = Number(value) || 0;
+    return num >= 0 ? `+${num}Hz` : `${num}Hz`;
+  }
+
+  function getUserSettings() {
+    return new Promise((resolve) => {
+      if (!chrome?.storage?.sync) {
+        resolve({ voiceCode: "auto", ratePercent: 0, volumePercent: 0, pitchHz: 0 });
+        return;
+      }
+      chrome.storage.sync.get(
+        {
+          voiceCode: "auto",
+          ratePercent: 0,
+          volumePercent: 0,
+          pitchHz: 0
+        },
+        resolve
+      );
+    });
+  }
+
   class EdgeTtsSession {
     constructor(text, { lang, voice, rate = "+0%", volume = "+0%", pitch = "+0Hz" }) {
       this.text = sanitizeText(text);
@@ -393,10 +421,23 @@
     cancelSpeech();
     if (!text) return;
 
-    const lang = detectLanguage(text);
-    const voice = pickVoiceForLang(lang);
+    const settings = await getUserSettings();
+    const detectedLang = detectLanguage(text);
+    let lang = detectedLang;
+    let voice = pickVoiceForLang(detectedLang);
+    if (settings.voiceCode && settings.voiceCode !== "auto") {
+      voice = settings.voiceCode;
+      const locale = voice.split(",")[0];
+      if (locale) lang = locale.trim();
+    }
 
-    const session = new EdgeTtsSession(text, { lang, voice });
+    const session = new EdgeTtsSession(text, {
+      lang,
+      voice,
+      rate: formatSignedPercent(settings.ratePercent),
+      volume: formatSignedPercent(settings.volumePercent),
+      pitch: formatSignedHz(settings.pitchHz)
+    });
     state.utterance = session;
     state.isSpeaking = true;
     updateButtonUI();

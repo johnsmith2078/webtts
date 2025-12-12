@@ -28,6 +28,7 @@
     }
   ],
   "action": {
-    "default_title": "Web TTS Helper"
+    "default_title": "Web TTS Helper",
+    "default_popup": "src/popup.html"
   }
 }
