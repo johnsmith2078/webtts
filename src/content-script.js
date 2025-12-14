@@ -5,8 +5,10 @@
 
   const state = {
     currentText: "",
+    currentRange: null,
     utterance: null,
-    isSpeaking: false
+    isSpeaking: false,
+    highlighter: null
   };
 
   const shadowHost = document.createElement("div");
@@ -47,8 +49,27 @@
       transform: translateY(0) scale(0.99);
       box-shadow: 0 2px 10px rgba(0,0,0,0.16);
     }
+    [data-web-tts-helper="highlight-layer"] {
+      pointer-events: none;
+      position: fixed;
+      left: 0;
+      top: 0;
+      width: 0;
+      height: 0;
+    }
+    .highlight-box {
+      position: fixed;
+      pointer-events: none;
+      background: rgba(255, 235, 59, 0.42);
+      border-radius: 4px;
+      box-shadow: 0 0 0 1px rgba(17, 24, 39, 0.12);
+    }
   `;
   shadowRoot.appendChild(style);
+
+  const highlightLayer = document.createElement("div");
+  highlightLayer.setAttribute("data-web-tts-helper", "highlight-layer");
+  shadowRoot.appendChild(highlightLayer);
 
   const button = document.createElement("button");
   button.type = "button";
@@ -381,7 +402,7 @@
     return text
       .replace(/[&<>]/g, " ")
       .replace(/[\u0000-\u0008\u000B-\u001F]/g, " ")
-      .replace(/[\r\n]+/g, " ");
+      .replace(/[\r\n]/g, " ");
   }
 
   function mkssml(text, voice, rate, volume, pitch, lang) {
@@ -414,15 +435,101 @@
   }
 
   function parseHeaders(message) {
-    const [rawHeaders] = message.split("\r\n\r\n");
+    const headerEnd = message.indexOf("\r\n\r\n");
+    const headerEndLf = headerEnd < 0 ? message.indexOf("\n\n") : -1;
+    const rawHeaders =
+      headerEnd >= 0
+        ? message.slice(0, headerEnd)
+        : headerEndLf >= 0
+          ? message.slice(0, headerEndLf)
+          : message;
     const headers = {};
-    rawHeaders.split("\r\n").forEach((line) => {
+    rawHeaders.split(/\r?\n/).forEach((line) => {
       const idx = line.indexOf(":");
       if (idx > 0) {
         headers[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
       }
     });
     return headers;
+  }
+
+  function parseBody(message) {
+    const idx = message.indexOf("\r\n\r\n");
+    if (idx >= 0) return message.slice(idx + 4);
+    const idxLf = message.indexOf("\n\n");
+    if (idxLf >= 0) return message.slice(idxLf + 2);
+    return "";
+  }
+
+  function safeJsonParse(text) {
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function ticksToMs(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return 0;
+    return num / 10000;
+  }
+
+  function extractWordBoundaries(metadata) {
+    const list = metadata?.Metadata || metadata?.metadata;
+    if (!Array.isArray(list)) return [];
+
+    const boundaries = [];
+    list.forEach((item) => {
+      const type = item?.Type || item?.type;
+      if (type !== "WordBoundary") return;
+
+      const data = item?.Data || item?.data || {};
+      const audioOffsetMs = ticksToMs(data.Offset ?? data.offset);
+      const durationMs = ticksToMs(data.Duration ?? data.duration);
+      const textInfo = data.text ?? data.Text ?? data.word ?? data.Word ?? null;
+
+      let word = "";
+      let textOffset = null;
+      let textLength = null;
+
+      if (textInfo && typeof textInfo === "object") {
+        word = String(textInfo.Text ?? textInfo.text ?? textInfo.Word ?? textInfo.word ?? "");
+
+        const offsetCandidate =
+          textInfo.Offset ?? textInfo.offset ?? textInfo.TextOffset ?? textInfo.textOffset ?? null;
+        const lengthCandidate =
+          textInfo.Length ??
+          textInfo.length ??
+          textInfo.WordLength ??
+          textInfo.wordLength ??
+          textInfo.TextLength ??
+          textInfo.textLength ??
+          null;
+
+        const offsetNum = Number(offsetCandidate);
+        if (Number.isFinite(offsetNum)) textOffset = offsetNum;
+
+        const lengthNum = Number(lengthCandidate);
+        if (Number.isFinite(lengthNum)) textLength = lengthNum;
+      } else if (typeof textInfo === "string") {
+        word = textInfo;
+      }
+
+      const dataTextOffsetNum = Number(data.TextOffset ?? data.textOffset);
+      if (Number.isFinite(dataTextOffsetNum)) textOffset = dataTextOffsetNum;
+
+      const dataTextLengthNum = Number(data.WordLength ?? data.wordLength ?? data.TextLength ?? data.textLength);
+      if (Number.isFinite(dataTextLengthNum)) textLength = dataTextLengthNum;
+
+      if (!Number.isFinite(Number(textOffset))) textOffset = 0;
+      if (!Number.isFinite(Number(textLength)) || Number(textLength) <= 0) textLength = word.length || 0;
+
+      boundaries.push({ audioOffsetMs, durationMs, textOffset, textLength, word });
+    });
+
+    return boundaries;
   }
 
   async function pickVoiceForLang(langOrTag) {
@@ -482,19 +589,28 @@
   }
 
   class EdgeTtsSession {
-    constructor(text, { lang, voice, rate = "+0%", volume = "+0%", pitch = "+0Hz" }) {
+    constructor(
+      text,
+      { lang, voice, rate = "+0%", volume = "+0%", pitch = "+0Hz", onBoundary = null }
+    ) {
       this.text = sanitizeText(text);
       this.lang = lang;
       this.voice = voice;
       this.rate = rate;
       this.volume = volume;
       this.pitch = pitch;
+      this.onBoundary = typeof onBoundary === "function" ? onBoundary : null;
       this.ws = null;
       this.audioEl = null;
       this.audioChunks = [];
+      this.boundaries = [];
+      this.boundaryRaf = 0;
+      this.boundaryIndex = -1;
       this.cancelled = false;
       this.partIndex = 0;
       this.parts = [];
+      this.partCharOffsets = [];
+      this.requestIdToPartIndex = new Map();
       this.requestId = "";
       this.playResolve = null;
       this.playReject = null;
@@ -502,6 +618,10 @@
 
     cancel() {
       this.cancelled = true;
+      if (this.boundaryRaf) {
+        cancelAnimationFrame(this.boundaryRaf);
+        this.boundaryRaf = 0;
+      }
       try {
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
           this.ws.close();
@@ -539,7 +659,11 @@
         `&ConnectionId=${connectionId}`;
 
       this.parts = [];
+      this.partCharOffsets = [];
+      this.boundaries = [];
+      this.requestIdToPartIndex = new Map();
       for (let i = 0; i < this.text.length; i += MAX_MESSAGE_SIZE) {
+        this.partCharOffsets.push(i);
         this.parts.push(this.text.slice(i, i + MAX_MESSAGE_SIZE));
       }
       this.partIndex = 0;
@@ -550,11 +674,32 @@
         const ws = new WebSocket(url);
         this.ws = ws;
         ws.binaryType = "arraybuffer";
+        const textDecoder = new TextDecoder();
+
+        const ingestMetadata = (headers, bodyText) => {
+          const requestId = headers["X-RequestId"] || headers["X-RequestID"] || "";
+          const partIndex = this.requestIdToPartIndex.get(requestId);
+          const partCharOffset =
+            typeof partIndex === "number" ? this.partCharOffsets[partIndex] || 0 : 0;
+          const payload = safeJsonParse(String(bodyText || "").trim());
+          const boundaries = extractWordBoundaries(payload);
+          boundaries.forEach((b) => {
+            this.boundaries.push({
+              partIndex: typeof partIndex === "number" ? partIndex : 0,
+              audioOffsetMs: b.audioOffsetMs,
+              durationMs: b.durationMs,
+              textOffset: partCharOffset + b.textOffset,
+              textLength: b.textLength,
+              word: b.word
+            });
+          });
+        };
 
         const sendPart = () => {
           if (this.cancelled || this.partIndex >= this.parts.length) return;
           const timestamp = dateToString();
           this.requestId = connectId();
+          this.requestIdToPartIndex.set(this.requestId, this.partIndex);
           ws.send(speechConfigMessage(timestamp));
           const ssml = mkssml(
             this.parts[this.partIndex],
@@ -576,6 +721,10 @@
           if (typeof event.data === "string") {
             const headers = parseHeaders(event.data);
             const path = headers["Path"];
+            if (path === "audio.metadata") {
+              ingestMetadata(headers, parseBody(event.data));
+              return;
+            }
             if (path === "turn.end") {
               this.partIndex += 1;
               if (this.partIndex < this.parts.length) {
@@ -587,7 +736,7 @@
             return;
           }
 
-          // Binary audio message.
+          // Binary message (audio or metadata).
           let binary = event.data;
           if (binary instanceof Blob) {
             binary = await binary.arrayBuffer();
@@ -596,8 +745,22 @@
           if (buf.length < 2) return;
           const headerLength = (buf[0] << 8) | buf[1];
           if (buf.length <= headerLength + 2) return;
-          const audioData = buf.slice(headerLength + 2);
-          this.audioChunks.push(audioData);
+          const headersText = textDecoder.decode(buf.slice(2, headerLength + 2));
+          const headers = parseHeaders(headersText);
+          const path = headers["Path"];
+          const payloadBytes = buf.slice(headerLength + 2);
+          if (!path) {
+            // Fallback: keep previous behavior for unexpected frames.
+            this.audioChunks.push(payloadBytes);
+            return;
+          }
+          if (path === "audio.metadata") {
+            ingestMetadata(headers, textDecoder.decode(payloadBytes));
+            return;
+          }
+          if (path === "audio") {
+            this.audioChunks.push(payloadBytes);
+          }
         };
 
         ws.onerror = (err) => {
@@ -621,6 +784,71 @@
           }
         };
       });
+    }
+
+    startBoundaryTracking() {
+      if (!this.audioEl || !this.onBoundary || !this.boundaries.length) return;
+      const audio = this.audioEl;
+
+      // If the offsets reset per part, approximate by stitching parts with their max (offset+duration).
+      const partCount = this.parts.length || 1;
+      const partStats = Array.from({ length: partCount }, () => ({ min: Infinity, max: 0 }));
+      this.boundaries.forEach((b) => {
+        const idx = typeof b.partIndex === "number" ? b.partIndex : 0;
+        const stat = partStats[idx] || partStats[0];
+        stat.min = Math.min(stat.min, b.audioOffsetMs);
+        stat.max = Math.max(stat.max, b.audioOffsetMs + (b.durationMs || 0));
+      });
+      const offsetsLookContinuous =
+        partCount <= 1 ||
+        partStats.slice(1).every((s, idx) => {
+          const prev = partStats[idx];
+          if (!Number.isFinite(s.min) || !Number.isFinite(prev.max)) return true;
+          return s.min >= prev.max - 100;
+        });
+
+      const partStartMs = new Array(partCount).fill(0);
+      if (!offsetsLookContinuous) {
+        for (let i = 1; i < partCount; i += 1) {
+          const prev = partStats[i - 1];
+          partStartMs[i] = partStartMs[i - 1] + (Number.isFinite(prev.max) ? prev.max : 0);
+        }
+      }
+
+      const timeline = this.boundaries
+        .map((b) => ({
+          ...b,
+          globalAudioOffsetMs:
+            (partStartMs[typeof b.partIndex === "number" ? b.partIndex : 0] || 0) + b.audioOffsetMs
+        }))
+        .filter((b) => Number.isFinite(b.globalAudioOffsetMs))
+        .sort((a, b) => a.globalAudioOffsetMs - b.globalAudioOffsetMs);
+
+      this.boundaryIndex = -1;
+      let lastEmittedIndex = -1;
+
+      const tick = () => {
+        if (this.cancelled || !this.audioEl) return;
+        const currentMs = audio.currentTime * 1000;
+        while (
+          this.boundaryIndex + 1 < timeline.length &&
+          timeline[this.boundaryIndex + 1].globalAudioOffsetMs <= currentMs
+        ) {
+          this.boundaryIndex += 1;
+        }
+
+        if (this.boundaryIndex !== lastEmittedIndex) {
+          lastEmittedIndex = this.boundaryIndex;
+          const boundary = timeline[this.boundaryIndex];
+          if (boundary) this.onBoundary(boundary);
+        }
+
+        if (!audio.ended && !audio.paused) {
+          this.boundaryRaf = requestAnimationFrame(tick);
+        }
+      };
+
+      this.boundaryRaf = requestAnimationFrame(tick);
     }
 
     async playCollectedAudio() {
@@ -656,7 +884,7 @@
         audio
           .play()
           .then(() => {
-            // playing
+            this.startBoundaryTracking();
           })
           .catch((e) => {
             URL.revokeObjectURL(audioUrl);
@@ -668,7 +896,260 @@
     }
   }
 
+  function rangeIntersectsNode(range, node) {
+    if (typeof range.intersectsNode === "function") {
+      try {
+        return range.intersectsNode(node);
+      } catch (_) {
+        return false;
+      }
+    }
+    try {
+      const nodeRange = document.createRange();
+      nodeRange.selectNode(node);
+      return (
+        range.compareBoundaryPoints(Range.END_TO_START, nodeRange) > 0 &&
+        range.compareBoundaryPoints(Range.START_TO_END, nodeRange) < 0
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function getNodeIndex(node) {
+    let i = 0;
+    let cur = node;
+    while (cur && cur.previousSibling) {
+      i += 1;
+      cur = cur.previousSibling;
+    }
+    return i;
+  }
+
+  function createRangeTextMap(range) {
+    const pieces = [];
+    const chunks = [];
+    let totalLength = 0;
+
+    function addTextPiece(node, startOffset, endOffset) {
+      const text = node.nodeValue?.slice(startOffset, endOffset) || "";
+      if (!text) return;
+      const startIndex = totalLength;
+      const endIndex = startIndex + text.length;
+      pieces.push({ type: "text", node, startOffset, startIndex, endIndex });
+      chunks.push(text);
+      totalLength = endIndex;
+    }
+
+    function addBrPiece(br) {
+      const parent = br.parentNode;
+      if (!parent) return;
+      const startIndex = totalLength;
+      const endIndex = startIndex + 1;
+      pieces.push({
+        type: "br",
+        afterContainer: parent,
+        afterOffset: getNodeIndex(br) + 1,
+        startIndex,
+        endIndex
+      });
+      chunks.push("\n");
+      totalLength = endIndex;
+    }
+
+    const root = range.commonAncestorContainer;
+
+    function considerNode(node) {
+      if (!rangeIntersectsNode(range, node)) return;
+
+      if (node.nodeType === Node.TEXT_NODE) {
+        const textLength = node.nodeValue?.length || 0;
+        if (!textLength) return;
+        let startOffset = 0;
+        let endOffset = textLength;
+        if (node === range.startContainer) startOffset = range.startOffset;
+        if (node === range.endContainer) endOffset = range.endOffset;
+        if (startOffset < 0) startOffset = 0;
+        if (endOffset > textLength) endOffset = textLength;
+        if (startOffset >= endOffset) return;
+        addTextPiece(node, startOffset, endOffset);
+        return;
+      }
+
+      if (node.nodeType === Node.ELEMENT_NODE && node.tagName === "BR") {
+        addBrPiece(node);
+      }
+    }
+
+    if (root.nodeType === Node.TEXT_NODE) {
+      considerNode(root);
+    } else {
+      const walker = document.createTreeWalker(
+        root,
+        NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+        {
+          acceptNode(node) {
+            if (!rangeIntersectsNode(range, node)) return NodeFilter.FILTER_REJECT;
+            if (node.nodeType === Node.TEXT_NODE) {
+              return node.nodeValue ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+            }
+            if (node.nodeType === Node.ELEMENT_NODE && node.tagName === "BR") {
+              return NodeFilter.FILTER_ACCEPT;
+            }
+            return NodeFilter.FILTER_SKIP;
+          }
+        }
+      );
+
+      let node = walker.nextNode();
+      while (node) {
+        considerNode(node);
+        node = walker.nextNode();
+      }
+    }
+
+    function findPieceForIndex(index) {
+      let low = 0;
+      let high = pieces.length - 1;
+      while (low <= high) {
+        const mid = (low + high) >> 1;
+        const piece = pieces[mid];
+        if (index < piece.startIndex) {
+          high = mid - 1;
+        } else if (index >= piece.endIndex) {
+          low = mid + 1;
+        } else {
+          return piece;
+        }
+      }
+      return null;
+    }
+
+    function indexToDomPosition(index) {
+      if (index <= 0) {
+        return { container: range.startContainer, offset: range.startOffset };
+      }
+      if (index >= totalLength) {
+        return { container: range.endContainer, offset: range.endOffset };
+      }
+
+      const piece = findPieceForIndex(index);
+      if (!piece) return { container: range.endContainer, offset: range.endOffset };
+
+      const delta = index - piece.startIndex;
+      if (piece.type === "text") {
+        return { container: piece.node, offset: piece.startOffset + delta };
+      }
+      if (piece.type === "br") {
+        return { container: piece.afterContainer, offset: piece.afterOffset };
+      }
+      return { container: range.endContainer, offset: range.endOffset };
+    }
+
+    function rangeForOffsets(start, end) {
+      const clampedStart = Math.max(0, Math.min(totalLength, start));
+      const clampedEnd = Math.max(0, Math.min(totalLength, end));
+      const s = Math.min(clampedStart, clampedEnd);
+      const e = Math.max(clampedStart, clampedEnd);
+
+      const startPos = indexToDomPosition(s);
+      const endPos = indexToDomPosition(e);
+      const r = document.createRange();
+      r.setStart(startPos.container, startPos.offset);
+      r.setEnd(endPos.container, endPos.offset);
+      return r;
+    }
+
+    return {
+      text: chunks.join(""),
+      length: totalLength,
+      rangeForOffsets
+    };
+  }
+
+  function createSelectionHighlighter(textMap) {
+    const boxes = [];
+    let activeRange = null;
+
+    function hideAll() {
+      boxes.forEach((b) => {
+        b.style.display = "none";
+      });
+    }
+
+    function updateFromRange(range) {
+      let rects = [];
+      try {
+        rects = Array.from(range.getClientRects()).filter((r) => r.width > 0 && r.height > 0);
+      } catch (_) {
+        rects = [];
+      }
+
+      for (let i = 0; i < rects.length; i += 1) {
+        const rect = rects[i];
+        let box = boxes[i];
+        if (!box) {
+          box = document.createElement("div");
+          box.className = "highlight-box";
+          highlightLayer.appendChild(box);
+          boxes.push(box);
+        }
+        box.style.display = "block";
+        box.style.left = `${rect.left}px`;
+        box.style.top = `${rect.top}px`;
+        box.style.width = `${rect.width}px`;
+        box.style.height = `${rect.height}px`;
+      }
+
+      for (let i = rects.length; i < boxes.length; i += 1) {
+        boxes[i].style.display = "none";
+      }
+    }
+
+    function refresh() {
+      if (!activeRange) return;
+      updateFromRange(activeRange);
+    }
+
+    const onScrollOrResize = () => refresh();
+    document.addEventListener("scroll", onScrollOrResize, true);
+    window.addEventListener("resize", onScrollOrResize, true);
+
+    return {
+      highlightOffsets(start, end) {
+        if (!textMap || !textMap.length) return;
+        if (!Number.isFinite(start) || !Number.isFinite(end)) {
+          activeRange = null;
+          hideAll();
+          return;
+        }
+        try {
+          activeRange = textMap.rangeForOffsets(start, end);
+          updateFromRange(activeRange);
+        } catch (_) {
+          activeRange = null;
+          hideAll();
+        }
+      },
+      clear() {
+        activeRange = null;
+        hideAll();
+      },
+      destroy() {
+        activeRange = null;
+        document.removeEventListener("scroll", onScrollOrResize, true);
+        window.removeEventListener("resize", onScrollOrResize, true);
+        boxes.forEach((b) => b.remove());
+        boxes.length = 0;
+      }
+    };
+  }
+
   function cancelSpeech() {
+    if (state.highlighter) {
+      state.highlighter.destroy();
+      state.highlighter = null;
+    }
     const session = state.utterance;
     if (session && typeof session.cancel === "function") {
       session.cancel();
@@ -678,7 +1159,7 @@
     updateButtonUI();
   }
 
-  async function speak(text) {
+  async function speak(text, textMap) {
     cancelSpeech();
     if (!text) return;
 
@@ -700,12 +1181,56 @@
       voice = await pickVoiceForLang(lang);
     }
 
-    const session = new EdgeTtsSession(text, {
+    if (textMap) {
+      try {
+        state.highlighter = createSelectionHighlighter(textMap);
+      } catch (_) {
+        state.highlighter = null;
+      }
+    }
+
+    const speechText = sanitizeText(text);
+    let scanCursor = 0;
+
+    const session = new EdgeTtsSession(speechText, {
       lang,
       voice,
       rate: formatSignedPercent(settings.ratePercent),
       volume: formatSignedPercent(settings.volumePercent),
-      pitch: formatSignedHz(settings.pitchHz)
+      pitch: formatSignedHz(settings.pitchHz),
+      onBoundary: (boundary) => {
+        if (state.utterance !== session) return;
+        const highlighter = state.highlighter;
+        if (!highlighter) return;
+
+        const word = String(boundary?.word || "");
+        const rawStart = Number(boundary?.textOffset);
+        const rawLength = Number(boundary?.textLength);
+
+        const startOk = Number.isFinite(rawStart) && rawStart >= 0 && rawStart <= speechText.length;
+        const lengthOk = Number.isFinite(rawLength) && rawLength > 0;
+
+        if (startOk && lengthOk && rawStart + rawLength <= speechText.length) {
+          if (!word || speechText.startsWith(word, rawStart)) {
+            scanCursor = Math.max(scanCursor, rawStart + rawLength);
+            highlighter.highlightOffsets(rawStart, rawStart + rawLength);
+            return;
+          }
+        }
+
+        if (word) {
+          let found = speechText.indexOf(word, scanCursor);
+          if (found < 0 && scanCursor > 0) found = speechText.indexOf(word);
+          if (found >= 0) {
+            const highlightLength = lengthOk ? rawLength : word.length;
+            scanCursor = found + Math.max(word.length, highlightLength);
+            highlighter.highlightOffsets(found, found + highlightLength);
+            return;
+          }
+        }
+
+        highlighter.clear();
+      }
     });
     state.utterance = session;
     state.isSpeaking = true;
@@ -719,6 +1244,10 @@
       if (state.utterance === session) {
         state.utterance = null;
         state.isSpeaking = false;
+        if (state.highlighter) {
+          state.highlighter.destroy();
+          state.highlighter = null;
+        }
         updateButtonUI();
         scheduleHide();
       }
@@ -751,8 +1280,9 @@
       return;
     }
 
-    const text = selection.toString().trim();
-    if (!text) {
+    const rawText = selection.toString();
+    const trimmedText = rawText.trim();
+    if (!trimmedText) {
       hideButton();
       return;
     }
@@ -771,7 +1301,8 @@
     const clampedLeft = Math.min(Math.max(desiredLeft, margin), viewportWidth - buttonSize - margin);
     const clampedTop = Math.min(Math.max(desiredTop, margin), viewportHeight - buttonSize - margin);
 
-    state.currentText = text;
+    state.currentText = rawText;
+    state.currentRange = range.cloneRange();
     button.style.left = `${clampedLeft}px`;
     button.style.top = `${clampedTop}px`;
     button.style.display = "inline-flex";
@@ -800,7 +1331,21 @@
       cancelSpeech();
       scheduleHide(800);
     } else {
-      speak(state.currentText);
+      let text = state.currentText;
+      let map = null;
+      if (state.currentRange) {
+        try {
+          map = createRangeTextMap(state.currentRange);
+          if (map?.text && map.text.trim()) {
+            text = map.text;
+          } else {
+            map = null;
+          }
+        } catch (_) {
+          map = null;
+        }
+      }
+      speak(text, map);
     }
   });
 
