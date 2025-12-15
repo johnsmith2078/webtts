@@ -523,7 +523,12 @@
       const dataTextLengthNum = Number(data.WordLength ?? data.wordLength ?? data.TextLength ?? data.textLength);
       if (Number.isFinite(dataTextLengthNum)) textLength = dataTextLengthNum;
 
-      if (!Number.isFinite(Number(textOffset))) textOffset = 0;
+      if (textOffset == null) {
+        textOffset = NaN;
+      } else {
+        const textOffsetNum = Number(textOffset);
+        textOffset = Number.isFinite(textOffsetNum) ? textOffsetNum : NaN;
+      }
       if (!Number.isFinite(Number(textLength)) || Number(textLength) <= 0) textLength = word.length || 0;
 
       boundaries.push({ audioOffsetMs, durationMs, textOffset, textLength, word });
@@ -1191,6 +1196,8 @@
 
     const speechText = sanitizeText(text);
     let scanCursor = 0;
+    const MAX_OFFSET_BACKTRACK_CHARS = 16;
+    const SEARCH_BACKTRACK_CHARS = 64;
 
     const session = new EdgeTtsSession(speechText, {
       lang,
@@ -1204,26 +1211,36 @@
         if (!highlighter) return;
 
         const word = String(boundary?.word || "");
-        const rawStart = Number(boundary?.textOffset);
-        const rawLength = Number(boundary?.textLength);
+        const rawStart = boundary?.textOffset == null ? NaN : Number(boundary.textOffset);
+        const rawLength = boundary?.textLength == null ? NaN : Number(boundary.textLength);
 
         const startOk = Number.isFinite(rawStart) && rawStart >= 0 && rawStart <= speechText.length;
         const lengthOk = Number.isFinite(rawLength) && rawLength > 0;
+        const highlightLength = lengthOk ? rawLength : word.length;
 
-        if (startOk && lengthOk && rawStart + rawLength <= speechText.length) {
-          if (!word || speechText.startsWith(word, rawStart)) {
-            scanCursor = Math.max(scanCursor, rawStart + rawLength);
-            highlighter.highlightOffsets(rawStart, rawStart + rawLength);
-            return;
-          }
+        const canUseRawOffset =
+          startOk &&
+          Number.isFinite(highlightLength) &&
+          highlightLength > 0 &&
+          rawStart + highlightLength <= speechText.length &&
+          rawStart >= Math.max(0, scanCursor - MAX_OFFSET_BACKTRACK_CHARS);
+
+        if (canUseRawOffset && (!word || speechText.startsWith(word, rawStart))) {
+          scanCursor = Math.max(scanCursor, rawStart + highlightLength);
+          highlighter.highlightOffsets(rawStart, rawStart + highlightLength);
+          return;
         }
 
         if (word) {
           let found = speechText.indexOf(word, scanCursor);
-          if (found < 0 && scanCursor > 0) found = speechText.indexOf(word);
-          if (found >= 0) {
-            const highlightLength = lengthOk ? rawLength : word.length;
-            scanCursor = found + Math.max(word.length, highlightLength);
+          if (found < 0 && scanCursor > 0) {
+            found = speechText.lastIndexOf(word, scanCursor);
+            if (found >= 0 && found < Math.max(0, scanCursor - SEARCH_BACKTRACK_CHARS)) {
+              found = -1;
+            }
+          }
+          if (found >= 0 && found + highlightLength <= speechText.length) {
+            scanCursor = Math.max(scanCursor, found + Math.max(word.length, highlightLength));
             highlighter.highlightOffsets(found, found + highlightLength);
             return;
           }
