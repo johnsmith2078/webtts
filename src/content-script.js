@@ -1196,8 +1196,7 @@
 
     const speechText = sanitizeText(text);
     let scanCursor = 0;
-    const MAX_OFFSET_BACKTRACK_CHARS = 16;
-    const SEARCH_BACKTRACK_CHARS = 64;
+    const MAX_OFFSET_BACKTRACK_CHARS = 0;
 
     const session = new EdgeTtsSession(speechText, {
       lang,
@@ -1233,12 +1232,6 @@
 
         if (word) {
           let found = speechText.indexOf(word, scanCursor);
-          if (found < 0 && scanCursor > 0) {
-            found = speechText.lastIndexOf(word, scanCursor);
-            if (found >= 0 && found < Math.max(0, scanCursor - SEARCH_BACKTRACK_CHARS)) {
-              found = -1;
-            }
-          }
           if (found >= 0 && found + highlightLength <= speechText.length) {
             scanCursor = Math.max(scanCursor, found + Math.max(word.length, highlightLength));
             highlighter.highlightOffsets(found, found + highlightLength);
