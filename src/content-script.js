@@ -351,6 +351,19 @@
 
   const CHROMIUM_FULL_VERSION = getChromiumFullVersion();
   const MAX_MESSAGE_SIZE = 8192 * 16;
+  const WSS_CONNECT_TIMEOUT_MS = 10000;
+  const WSS_MAX_RETRIES = 2;
+  const WSS_RETRY_BASE_DELAY_MS = 350;
+  const WSS_RETRY_MAX_DELAY_MS = 1400;
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function computeRetryDelayMs(failureCount) {
+    const exp = Math.min(WSS_RETRY_MAX_DELAY_MS, WSS_RETRY_BASE_DELAY_MS * 2 ** failureCount);
+    return Math.round(exp * (0.8 + Math.random() * 0.4));
+  }
 
   function connectId() {
     if (crypto.randomUUID) {
@@ -628,7 +641,10 @@
         this.boundaryRaf = 0;
       }
       try {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        if (
+          this.ws &&
+          (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)
+        ) {
           this.ws.close();
         }
       } catch (_) {
@@ -654,6 +670,28 @@
     }
 
     async start() {
+      let failures = 0;
+      while (true) {
+        try {
+          await this.startOnce();
+          return;
+        } catch (err) {
+          if (this.cancelled) return;
+          const retryable = Boolean(err && err.edgeTtsRetryable);
+          if (!retryable || failures >= WSS_MAX_RETRIES) throw err;
+          const delayMs = computeRetryDelayMs(failures);
+          failures += 1;
+          console.warn("Edge TTS websocket failed, retrying...", {
+            attempt: failures,
+            delayMs,
+            message: err && err.message ? err.message : String(err)
+          });
+          await sleep(delayMs);
+        }
+      }
+    }
+
+    async startOnce() {
       const secMsGec = await generateSecMsGecToken();
       const secMsGecVersion = generateSecMsGecVersion();
       const connectionId = connectId();
@@ -665,6 +703,7 @@
 
       this.parts = [];
       this.partCharOffsets = [];
+      this.audioChunks = [];
       this.boundaries = [];
       this.requestIdToPartIndex = new Map();
       for (let i = 0; i < this.text.length; i += MAX_MESSAGE_SIZE) {
@@ -676,10 +715,29 @@
       return new Promise((resolve, reject) => {
         if (this.cancelled) return resolve();
 
+        let hadWsError = false;
+        let timedOut = false;
+
+        const makeRetryableError = (message, extra = {}) => {
+          const err = new Error(message);
+          err.edgeTtsRetryable = true;
+          Object.assign(err, extra);
+          return err;
+        };
+
         const ws = new WebSocket(url);
         this.ws = ws;
         ws.binaryType = "arraybuffer";
         const textDecoder = new TextDecoder();
+
+        const connectTimer = setTimeout(() => {
+          timedOut = true;
+          try {
+            ws.close();
+          } catch (_) {
+            // ignore
+          }
+        }, WSS_CONNECT_TIMEOUT_MS);
 
         const ingestMetadata = (headers, bodyText) => {
           const requestId = headers["X-RequestId"] || headers["X-RequestID"] || "";
@@ -705,19 +763,29 @@
           const timestamp = dateToString();
           this.requestId = connectId();
           this.requestIdToPartIndex.set(this.requestId, this.partIndex);
-          ws.send(speechConfigMessage(timestamp));
-          const ssml = mkssml(
-            this.parts[this.partIndex],
-            this.voice,
-            this.rate,
-            this.volume,
-            this.pitch,
-            this.lang
-          );
-          ws.send(ssmlMessage(this.requestId, timestamp, ssml));
+          try {
+            ws.send(speechConfigMessage(timestamp));
+            const ssml = mkssml(
+              this.parts[this.partIndex],
+              this.voice,
+              this.rate,
+              this.volume,
+              this.pitch,
+              this.lang
+            );
+            ws.send(ssmlMessage(this.requestId, timestamp, ssml));
+          } catch (_) {
+            hadWsError = true;
+            try {
+              ws.close();
+            } catch (_) {
+              // ignore
+            }
+          }
         };
 
         ws.onopen = () => {
+          clearTimeout(connectTimer);
           sendPart();
         };
 
@@ -768,18 +836,31 @@
           }
         };
 
-        ws.onerror = (err) => {
-          if (this.cancelled) return resolve();
-          reject(err);
+        ws.onerror = () => {
+          hadWsError = true;
         };
 
         ws.onclose = async (ev) => {
+          clearTimeout(connectTimer);
+          this.ws = null;
+
           if (this.cancelled) return resolve();
           if (!this.audioChunks.length) {
-            console.warn("Edge TTS websocket closed without audio", {
-              code: ev.code,
-              reason: ev.reason
-            });
+            const code = ev && typeof ev.code === "number" ? ev.code : 0;
+            const reason = ev && ev.reason ? ev.reason : "";
+            const baseMsg = timedOut
+              ? "Edge TTS websocket connect timeout"
+              : "Edge TTS websocket closed without audio";
+            const msg = `${baseMsg} (code=${code}${reason ? ` reason=${reason}` : ""})`;
+            reject(
+              makeRetryableError(msg, {
+                closeCode: code,
+                closeReason: reason,
+                hadWsError,
+                timedOut
+              })
+            );
+            return;
           }
           try {
             await this.playCollectedAudio();
@@ -1195,6 +1276,13 @@
     }
 
     const speechText = sanitizeText(text);
+    if (!speechText.trim()) {
+      if (state.highlighter) {
+        state.highlighter.destroy();
+        state.highlighter = null;
+      }
+      return;
+    }
     let scanCursor = 0;
     const MAX_OFFSET_BACKTRACK_CHARS = 0;
 
