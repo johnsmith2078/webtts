@@ -85,6 +85,9 @@
 
   let hideTimer = null;
 
+  const DEFAULT_GTTS_LANG = "en";
+  const DEFAULT_GTTS_TLD = "com";
+
   const DEFAULT_FALLBACK_LOCALE = "en-US";
   const DEFAULT_FALLBACK_VOICE = "en-US, AriaNeural";
 
@@ -590,20 +593,451 @@
   function getUserSettings() {
     return new Promise((resolve) => {
       if (!chrome?.storage?.sync) {
-        resolve({ languageName: "__auto__", voiceCode: "auto", ratePercent: 0, volumePercent: 0, pitchHz: 0 });
+        resolve({
+          gttsLanguage: "__auto__",
+          gttsTld: DEFAULT_GTTS_TLD,
+          gttsSlow: false,
+          ratePercent: 0,
+          volumePercent: 0
+        });
         return;
       }
       chrome.storage.sync.get(
         {
-          languageName: "__auto__",
-          voiceCode: "auto",
+          gttsLanguage: "__auto__",
+          gttsTld: DEFAULT_GTTS_TLD,
+          gttsSlow: false,
           ratePercent: 0,
-          volumePercent: 0,
-          pitchHz: 0
+          volumePercent: 0
         },
         resolve
       );
     });
+  }
+
+  function sendMessageToBackground(message) {
+    return new Promise((resolve, reject) => {
+      const sender = chrome?.runtime?.sendMessage;
+      if (typeof sender !== "function") {
+        reject(new Error("chrome.runtime.sendMessage unavailable"));
+        return;
+      }
+
+      sender(message, (response) => {
+        if (chrome?.runtime?.lastError) {
+          reject(new Error(chrome.runtime.lastError.message || "sendMessage failed"));
+          return;
+        }
+        resolve(response);
+      });
+    });
+  }
+
+  function sendGttsCancel(requestId) {
+    const sender = chrome?.runtime?.sendMessage;
+    if (typeof sender !== "function") return;
+    sender({ type: "gttsCancel", requestId }, () => {
+      // ignore errors
+    });
+  }
+
+  function concatUint8Arrays(chunks) {
+    const total = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      merged.set(c, offset);
+      offset += c.byteLength;
+    }
+    return merged;
+  }
+
+  function base64ToUint8Array(base64) {
+    const bin = atob(base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+
+  function normalizeAudioBuffer(value) {
+    if (!value) return null;
+    if (value instanceof ArrayBuffer) return value;
+
+    if (ArrayBuffer.isView(value) && value.buffer instanceof ArrayBuffer) {
+      return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+    }
+
+    return null;
+  }
+
+  function looksLikeMp3(buffer) {
+    const bytes = new Uint8Array(buffer);
+    if (bytes.length < 3) return false;
+    const hasId3 = bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33;
+    const hasFrameSync = bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0;
+    return hasId3 || hasFrameSync;
+  }
+
+  const GTTS_LANGUAGE_ALIASES = {
+    fil: "tl",
+    he: "iw",
+    in: "id",
+    jv: "jw"
+  };
+
+  const GTTS_LANG_ALLOWLIST = new Set(["fr-CA", "pt-PT", "zh", "zh-CN", "zh-TW"]);
+
+  const DEPRECATED_GTTS_LANG_FALLBACK = {
+    "en-us": "en",
+    "en-ca": "en",
+    "en-uk": "en",
+    "en-gb": "en",
+    "en-au": "en",
+    "en-gh": "en",
+    "en-in": "en",
+    "en-ie": "en",
+    "en-nz": "en",
+    "en-ng": "en",
+    "en-ph": "en",
+    "en-za": "en",
+    "en-tz": "en",
+    "fr-fr": "fr",
+    "pt-br": "pt",
+    "pt-pt": "pt",
+    "es-es": "es",
+    "es-us": "es",
+    "zh-cn": "zh-CN",
+    "zh-tw": "zh-TW"
+  };
+
+  function normalizeGttsLang(tag) {
+    const raw = String(tag || "").trim();
+    if (!raw) return "";
+
+    const lower = raw.toLowerCase();
+    if (lower === "zh-hans") return "zh-CN";
+    if (lower === "zh-hant") return "zh-TW";
+
+    const parts = lower.split("-");
+    const base = GTTS_LANGUAGE_ALIASES[parts[0]] || parts[0];
+    const rest = parts
+      .slice(1)
+      .map((p) => (p.length === 2 ? p.toUpperCase() : p));
+    const normalized = [base, ...rest].join("-");
+
+    const deprecatedFallback = DEPRECATED_GTTS_LANG_FALLBACK[normalized.toLowerCase()];
+    if (deprecatedFallback) return deprecatedFallback;
+
+    if (GTTS_LANG_ALLOWLIST.has(normalized)) return normalized;
+    return base;
+  }
+
+  async function detectGttsLang(text) {
+    const trimmed = String(text || "").trim();
+    const nav = normalizeGttsLang(navigator.language) || DEFAULT_GTTS_LANG;
+    if (!trimmed) return nav;
+
+    const chromeTag = await detectLanguageWithChrome(trimmed);
+    const guessedTag = chromeTag || guessLanguageTagByScript(trimmed) || navigator.language || DEFAULT_GTTS_LANG;
+    return normalizeGttsLang(guessedTag) || nav;
+  }
+
+  function computePlaybackRate(ratePercent) {
+    const num = Number(ratePercent) || 0;
+    const rate = 1 + num / 100;
+    if (!Number.isFinite(rate) || rate <= 0) return 1;
+    return Math.max(0.25, Math.min(3, rate));
+  }
+
+  function computeVolumeGain(volumePercent) {
+    const num = Number(volumePercent) || 0;
+    const gain = 1 + num / 100;
+    if (!Number.isFinite(gain) || gain < 0) return 1;
+    return Math.max(0, Math.min(3, gain));
+  }
+
+  function trimTextForSpeech(text) {
+    const raw = String(text || "");
+    const leadingMatch = raw.match(/^\s*/);
+    const trailingMatch = raw.match(/\s*$/);
+    const leading = leadingMatch ? leadingMatch[0].length : 0;
+    const trailing = trailingMatch ? trailingMatch[0].length : 0;
+    const end = Math.max(leading, raw.length - trailing);
+    return { trimmedText: raw.slice(leading, end), trimOffset: leading };
+  }
+
+  const CJK_RE =
+    /[\u3040-\u30ff\uff66-\uff9d\uac00-\ud7af\u1100-\u11ff\u3130-\u318f\u4e00-\u9fff]/;
+  const HAS_SPACE_RE = /\s/;
+
+  function computeHighlightRange(text, index) {
+    const s = String(text || "");
+    const len = s.length;
+    if (!len) return null;
+
+    let i = Number(index);
+    if (!Number.isFinite(i)) i = 0;
+    i = Math.max(0, Math.min(len - 1, Math.floor(i)));
+
+    if (/\s/.test(s[i])) {
+      let left = i - 1;
+      let right = i + 1;
+      while (left >= 0 || right < len) {
+        if (left >= 0 && !/\s/.test(s[left])) {
+          i = left;
+          break;
+        }
+        if (right < len && !/\s/.test(s[right])) {
+          i = right;
+          break;
+        }
+        left -= 1;
+        right += 1;
+      }
+    }
+
+    const hasSpaces = HAS_SPACE_RE.test(s);
+    const isCjk = CJK_RE.test(s);
+
+    if (!hasSpaces || isCjk) {
+      return { start: i, end: Math.min(len, i + 1) };
+    }
+
+    let start = i;
+    while (start > 0 && !/\s/.test(s[start - 1])) start -= 1;
+    let end = i + 1;
+    while (end < len && !/\s/.test(s[end])) end += 1;
+    if (end <= start) return null;
+    return { start, end };
+  }
+
+  function createRequestId() {
+    if (crypto.randomUUID) return crypto.randomUUID();
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  class GttsSession {
+    constructor(
+      text,
+      { lang, tld, slow = false, playbackRate = 1, volumeGain = 1, trimOffset = 0, highlighter = null }
+    ) {
+      this.text = String(text || "");
+      this.lang = normalizeGttsLang(lang) || DEFAULT_GTTS_LANG;
+      this.tld = String(tld || DEFAULT_GTTS_TLD).trim() || DEFAULT_GTTS_TLD;
+      this.slow = Boolean(slow);
+
+      const rateNum = Number(playbackRate);
+      this.playbackRate = Number.isFinite(rateNum) && rateNum > 0 ? Math.max(0.25, Math.min(3, rateNum)) : 1;
+
+      const gainNum = Number(volumeGain);
+      this.volumeGain = Number.isFinite(gainNum) ? Math.max(0, Math.min(3, gainNum)) : 1;
+      this.trimOffset = Number(trimOffset) || 0;
+      this.highlighter = highlighter;
+
+      this.requestId = createRequestId();
+      this.cancelled = false;
+
+      this.audioEl = null;
+      this.audioUrl = "";
+      this.audioContext = null;
+      this.boundaryRaf = 0;
+      this.playResolve = null;
+      this.playReject = null;
+    }
+
+    cancel() {
+      this.cancelled = true;
+      if (this.boundaryRaf) {
+        cancelAnimationFrame(this.boundaryRaf);
+        this.boundaryRaf = 0;
+      }
+      if (this.requestId) sendGttsCancel(this.requestId);
+      this.cleanupAudio();
+      if (this.playResolve) {
+        try {
+          this.playResolve();
+        } catch (_) {
+          // ignore
+        }
+        this.playResolve = null;
+        this.playReject = null;
+      }
+    }
+
+    cleanupAudio() {
+      if (this.audioEl) {
+        try {
+          this.audioEl.pause();
+          this.audioEl.src = "";
+        } catch (_) {
+          // ignore
+        }
+        this.audioEl = null;
+      }
+
+      if (this.audioUrl) {
+        try {
+          URL.revokeObjectURL(this.audioUrl);
+        } catch (_) {
+          // ignore
+        }
+        this.audioUrl = "";
+      }
+
+      if (this.audioContext) {
+        try {
+          this.audioContext.close();
+        } catch (_) {
+          // ignore
+        }
+        this.audioContext = null;
+      }
+    }
+
+    async start() {
+      const response = await sendMessageToBackground({
+        type: "gttsSynthesize",
+        requestId: this.requestId,
+        text: this.text,
+        lang: this.lang,
+        tld: this.tld,
+        slow: this.slow
+      });
+
+      if (this.cancelled) return;
+      if (!response || !response.ok) {
+        throw new Error(response && response.error ? response.error : "gTTS synthesis failed");
+      }
+
+      let audioBuffer = normalizeAudioBuffer(response.audioBuffer);
+      if (!audioBuffer) {
+        const base64Chunks = response.audioBase64Chunks;
+        if (Array.isArray(base64Chunks) && base64Chunks.length) {
+          const chunks = base64Chunks.map((b64) => base64ToUint8Array(String(b64 || "")));
+          audioBuffer = concatUint8Arrays(chunks).buffer;
+        }
+      }
+
+      if (!audioBuffer || audioBuffer.byteLength <= 0) throw new Error("gTTS missing audio");
+      if (!looksLikeMp3(audioBuffer)) {
+        throw new Error(`gTTS returned non-MP3 data (size=${audioBuffer.byteLength})`);
+      }
+
+      await this.playAudio(audioBuffer);
+    }
+
+    applyVolume(audio) {
+      const gain = Number(this.volumeGain);
+      if (!Number.isFinite(gain) || gain < 0) return;
+
+      if (gain <= 1) {
+        audio.volume = gain;
+        return;
+      }
+
+      audio.volume = 1;
+      try {
+        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextCtor) return;
+
+        const ctx = new AudioContextCtor();
+        const source = ctx.createMediaElementSource(audio);
+        const gainNode = ctx.createGain();
+        gainNode.gain.value = gain;
+        source.connect(gainNode);
+        gainNode.connect(ctx.destination);
+        this.audioContext = ctx;
+      } catch (_) {
+        // ignore
+      }
+    }
+
+    startProgressTracking() {
+      const audio = this.audioEl;
+      const highlighter = this.highlighter;
+      if (!audio || !highlighter || !this.text) return;
+
+      let lastStart = -1;
+      let lastEnd = -1;
+
+      const initialRange = computeHighlightRange(this.text, 0);
+      if (initialRange) {
+        lastStart = this.trimOffset + initialRange.start;
+        lastEnd = this.trimOffset + initialRange.end;
+        highlighter.highlightOffsets(lastStart, lastEnd);
+      }
+
+      const tick = () => {
+        if (this.cancelled || !this.audioEl) return;
+        if (audio.ended || audio.paused) return;
+
+        const duration = audio.duration;
+        if (Number.isFinite(duration) && duration > 0) {
+          const ratio = Math.max(0, Math.min(1, audio.currentTime / duration));
+          const idx = Math.min(this.text.length - 1, Math.floor(ratio * this.text.length));
+          const range = computeHighlightRange(this.text, idx);
+          if (range) {
+            const start = this.trimOffset + range.start;
+            const end = this.trimOffset + range.end;
+            if (start !== lastStart || end !== lastEnd) {
+              lastStart = start;
+              lastEnd = end;
+              highlighter.highlightOffsets(start, end);
+            }
+          }
+        }
+
+        this.boundaryRaf = requestAnimationFrame(tick);
+      };
+
+      this.boundaryRaf = requestAnimationFrame(tick);
+    }
+
+    async playAudio(audioBuffer) {
+      const blob = new Blob([audioBuffer], { type: "audio/mpeg" });
+      const audioUrl = URL.createObjectURL(blob);
+      this.audioUrl = audioUrl;
+
+      const audio = new Audio(audioUrl);
+      this.audioEl = audio;
+      audio.playbackRate = this.playbackRate;
+      this.applyVolume(audio);
+
+      return new Promise((resolve, reject) => {
+        this.playResolve = resolve;
+        this.playReject = reject;
+
+        audio.onended = () => {
+          this.playResolve = null;
+          this.playReject = null;
+          this.cleanupAudio();
+          resolve();
+        };
+        audio.onerror = () => {
+          this.playResolve = null;
+          this.playReject = null;
+          this.cleanupAudio();
+          const code = audio.error && typeof audio.error.code === "number" ? audio.error.code : 0;
+          reject(new Error(`audio playback failed (code=${code})`));
+        };
+
+        audio
+          .play()
+          .then(() => {
+            this.startProgressTracking();
+          })
+          .catch((e) => {
+            this.playResolve = null;
+            this.playReject = null;
+            this.cleanupAudio();
+            reject(e);
+          });
+      });
+    }
   }
 
   class EdgeTtsSession {
@@ -1251,22 +1685,6 @@
 
     const settings = await getUserSettings();
 
-    let lang = "";
-    let voice = "";
-
-    if (settings.voiceCode && settings.voiceCode !== "auto") {
-      voice = settings.voiceCode;
-      const locale = voice.split(",")[0];
-      lang = (locale && locale.trim()) || navigator.language || DEFAULT_FALLBACK_LOCALE;
-    } else if (settings.languageName && settings.languageName !== "__auto__") {
-      const picked = await pickVoiceForLanguageName(settings.languageName);
-      lang = picked.lang;
-      voice = picked.voice;
-    } else {
-      lang = await detectLanguage(text);
-      voice = await pickVoiceForLang(lang);
-    }
-
     if (textMap) {
       try {
         state.highlighter = createSelectionHighlighter(textMap);
@@ -1276,59 +1694,31 @@
     }
 
     const speechText = sanitizeText(text);
-    if (!speechText.trim()) {
+    const trimmed = trimTextForSpeech(speechText);
+    if (!trimmed.trimmedText.trim()) {
       if (state.highlighter) {
         state.highlighter.destroy();
         state.highlighter = null;
       }
       return;
     }
-    let scanCursor = 0;
-    const MAX_OFFSET_BACKTRACK_CHARS = 0;
 
-    const session = new EdgeTtsSession(speechText, {
+    const tld = String(settings.gttsTld || DEFAULT_GTTS_TLD).trim() || DEFAULT_GTTS_TLD;
+    const slow = Boolean(settings.gttsSlow);
+
+    const lang =
+      settings.gttsLanguage && settings.gttsLanguage !== "__auto__"
+        ? normalizeGttsLang(settings.gttsLanguage) || DEFAULT_GTTS_LANG
+        : await detectGttsLang(trimmed.trimmedText);
+
+    const session = new GttsSession(trimmed.trimmedText, {
       lang,
-      voice,
-      rate: formatSignedPercent(settings.ratePercent),
-      volume: formatSignedPercent(settings.volumePercent),
-      pitch: formatSignedHz(settings.pitchHz),
-      onBoundary: (boundary) => {
-        if (state.utterance !== session) return;
-        const highlighter = state.highlighter;
-        if (!highlighter) return;
-
-        const word = String(boundary?.word || "");
-        const rawStart = boundary?.textOffset == null ? NaN : Number(boundary.textOffset);
-        const rawLength = boundary?.textLength == null ? NaN : Number(boundary.textLength);
-
-        const startOk = Number.isFinite(rawStart) && rawStart >= 0 && rawStart <= speechText.length;
-        const lengthOk = Number.isFinite(rawLength) && rawLength > 0;
-        const highlightLength = lengthOk ? rawLength : word.length;
-
-        const canUseRawOffset =
-          startOk &&
-          Number.isFinite(highlightLength) &&
-          highlightLength > 0 &&
-          rawStart + highlightLength <= speechText.length &&
-          rawStart >= Math.max(0, scanCursor - MAX_OFFSET_BACKTRACK_CHARS);
-
-        if (canUseRawOffset && (!word || speechText.startsWith(word, rawStart))) {
-          scanCursor = Math.max(scanCursor, rawStart + highlightLength);
-          highlighter.highlightOffsets(rawStart, rawStart + highlightLength);
-          return;
-        }
-
-        if (word) {
-          let found = speechText.indexOf(word, scanCursor);
-          if (found >= 0 && found + highlightLength <= speechText.length) {
-            scanCursor = Math.max(scanCursor, found + Math.max(word.length, highlightLength));
-            highlighter.highlightOffsets(found, found + highlightLength);
-            return;
-          }
-        }
-
-        highlighter.clear();
-      }
+      tld,
+      slow,
+      playbackRate: computePlaybackRate(settings.ratePercent),
+      volumeGain: computeVolumeGain(settings.volumePercent),
+      trimOffset: trimmed.trimOffset,
+      highlighter: state.highlighter
     });
     state.utterance = session;
     state.isSpeaking = true;
@@ -1337,7 +1727,8 @@
     try {
       await session.start();
     } catch (err) {
-      console.error("Edge TTS error:", err);
+      const message = err && err.message ? err.message : String(err);
+      if (message !== "cancelled") console.error("gTTS error:", err);
     } finally {
       if (state.utterance === session) {
         state.utterance = null;

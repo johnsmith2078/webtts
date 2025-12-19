@@ -56,13 +56,18 @@
     <h1>朗读设置</h1>
 
     <div class="row">
-      <label for="language">语音</label>
+      <label for="language">语言</label>
       <select id="language"></select>
     </div>
 
     <div class="row">
-      <label for="voice">音色</label>
-      <select id="voice"></select>
+      <label for="tld">域名</label>
+      <select id="tld"></select>
+    </div>
+
+    <div class="row">
+      <label for="slow">慢速</label>
+      <input id="slow" type="checkbox" />
     </div>
 
     <div class="row">
@@ -77,15 +82,8 @@
       <span id="volumeValue" class="value"></span>
     </div>
 
-    <div class="row">
-      <label for="pitch">音高</label>
-      <input id="pitch" type="range" min="-50" max="50" step="1" />
-      <span id="pitchValue" class="value"></span>
-    </div>
-
     <div class="hint">设置会自动保存，下一次朗读时生效。</div>
 
     <script src="popup.js"></script>
   </body>
 </html>
-

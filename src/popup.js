@@ -1,70 +1,129 @@
 (() => {
   const languageSelect = document.getElementById("language");
-  const voiceSelect = document.getElementById("voice");
+  const tldSelect = document.getElementById("tld");
+  const slowCheckbox = document.getElementById("slow");
   const rateRange = document.getElementById("rate");
   const volumeRange = document.getElementById("volume");
-  const pitchRange = document.getElementById("pitch");
   const rateValue = document.getElementById("rateValue");
   const volumeValue = document.getElementById("volumeValue");
-  const pitchValue = document.getElementById("pitchValue");
 
-  let voiceData = {};
+  const GTTS_LANGS = {
+    af: "Afrikaans",
+    am: "Amharic",
+    ar: "Arabic",
+    bg: "Bulgarian",
+    bn: "Bengali",
+    bs: "Bosnian",
+    ca: "Catalan",
+    cs: "Czech",
+    cy: "Welsh",
+    da: "Danish",
+    de: "German",
+    el: "Greek",
+    en: "English",
+    es: "Spanish",
+    et: "Estonian",
+    eu: "Basque",
+    fi: "Finnish",
+    fr: "French",
+    "fr-CA": "French (Canada)",
+    gl: "Galician",
+    gu: "Gujarati",
+    ha: "Hausa",
+    hi: "Hindi",
+    hr: "Croatian",
+    hu: "Hungarian",
+    id: "Indonesian",
+    is: "Icelandic",
+    it: "Italian",
+    iw: "Hebrew",
+    ja: "Japanese",
+    jw: "Javanese",
+    km: "Khmer",
+    kn: "Kannada",
+    ko: "Korean",
+    la: "Latin",
+    lt: "Lithuanian",
+    lv: "Latvian",
+    ml: "Malayalam",
+    mr: "Marathi",
+    ms: "Malay",
+    my: "Myanmar (Burmese)",
+    ne: "Nepali",
+    nl: "Dutch",
+    no: "Norwegian",
+    pa: "Punjabi (Gurmukhi)",
+    pl: "Polish",
+    pt: "Portuguese (Brazil)",
+    "pt-PT": "Portuguese (Portugal)",
+    ro: "Romanian",
+    ru: "Russian",
+    si: "Sinhala",
+    sk: "Slovak",
+    sq: "Albanian",
+    sr: "Serbian",
+    su: "Sundanese",
+    sv: "Swedish",
+    sw: "Swahili",
+    ta: "Tamil",
+    te: "Telugu",
+    th: "Thai",
+    tl: "Filipino",
+    tr: "Turkish",
+    uk: "Ukrainian",
+    ur: "Urdu",
+    vi: "Vietnamese",
+    yue: "Cantonese",
+    "zh-CN": "Chinese (Simplified)",
+    "zh-TW": "Chinese (Traditional)",
+    zh: "Chinese (Mandarin)"
+  };
+
+  const GTTS_TLDS = [
+    { value: "com", label: "translate.google.com" },
+    { value: "com.hk", label: "translate.google.com.hk" },
+    { value: "cn", label: "translate.google.cn" }
+  ];
 
   function updateRangeLabels() {
     rateValue.textContent = `${rateRange.value}%`;
     volumeValue.textContent = `${volumeRange.value}%`;
-    pitchValue.textContent = `${pitchRange.value}Hz`;
   }
 
   function populateLanguages() {
     languageSelect.innerHTML = "";
     languageSelect.add(new Option("自动(根据文本)", "__auto__"));
-    Object.keys(voiceData)
-      .sort()
-      .forEach((lang) => {
-        languageSelect.add(new Option(lang, lang));
+    Object.entries(GTTS_LANGS)
+      .sort((a, b) => a[1].localeCompare(b[1], "en", { sensitivity: "base" }))
+      .forEach(([code, name]) => {
+        languageSelect.add(new Option(`${name} (${code})`, code));
       });
   }
 
-  function populateVoices(language) {
-    voiceSelect.innerHTML = "";
-    voiceSelect.add(new Option("自动", "__auto__"));
-
-    if (language === "__auto__") {
-      voiceSelect.disabled = true;
-      return;
-    }
-    voiceSelect.disabled = false;
-    const list = voiceData[language] || [];
-    list.forEach((v) => {
-      voiceSelect.add(new Option(v.name, v.code));
+  function populateTlds() {
+    tldSelect.innerHTML = "";
+    GTTS_TLDS.forEach((item) => {
+      tldSelect.add(new Option(item.label, item.value));
     });
   }
 
   function saveSettings() {
-    const languageName = languageSelect.value;
-    const selectedVoiceValue = voiceSelect.disabled ? "__auto__" : voiceSelect.value;
-    const voiceCode = selectedVoiceValue === "__auto__" ? "auto" : selectedVoiceValue;
-    const voiceName =
-      selectedVoiceValue === "__auto__" ? "" : voiceSelect.options[voiceSelect.selectedIndex]?.text || "";
-
     chrome.storage.sync.set({
-      languageName,
-      voiceCode,
-      voiceName,
+      gttsLanguage: languageSelect.value,
+      gttsTld: tldSelect.value,
+      gttsSlow: Boolean(slowCheckbox.checked),
       ratePercent: Number(rateRange.value) || 0,
-      volumePercent: Number(volumeRange.value) || 0,
-      pitchHz: Number(pitchRange.value) || 0
+      volumePercent: Number(volumeRange.value) || 0
     });
   }
 
   function attachListeners() {
     languageSelect.addEventListener("change", () => {
-      populateVoices(languageSelect.value);
       saveSettings();
     });
-    voiceSelect.addEventListener("change", saveSettings);
-    [rateRange, volumeRange, pitchRange].forEach((el) => {
+    tldSelect.addEventListener("change", saveSettings);
+    slowCheckbox.addEventListener("change", saveSettings);
+    [rateRange, volumeRange].forEach((el) => {
       el.addEventListener("input", () => {
         updateRangeLabels();
       });
@@ -72,56 +131,32 @@
     });
   }
 
-  async function loadVoiceList() {
-    const url = chrome.runtime.getURL("src/voice_list.tsv");
-    const text = await fetch(url).then((r) => r.text());
-    const data = {};
-    text.split(/\r?\n/).forEach((line) => {
-      if (!line.trim()) return;
-      const fields = line.split("\t");
-      if (fields.length < 3) return;
-      const language = fields[0];
-      const voiceName = fields[1];
-      const code = fields[2];
-      if (!data[language]) data[language] = [];
-      data[language].push({ name: voiceName, code });
-    });
-    voiceData = data;
-  }
-
   function restoreSettings() {
     chrome.storage.sync.get(
       {
-        languageName: "__auto__",
-        voiceCode: "auto",
+        gttsLanguage: "__auto__",
+        gttsTld: "com",
+        gttsSlow: false,
         ratePercent: 0,
-        volumePercent: 0,
-        pitchHz: 0
+        volumePercent: 0
       },
       (items) => {
-        const lang = items.languageName || "__auto__";
+        const lang = items.gttsLanguage || "__auto__";
         languageSelect.value = lang;
-        populateVoices(lang);
-
-        if (items.voiceCode && items.voiceCode !== "auto" && !voiceSelect.disabled) {
-          voiceSelect.value = items.voiceCode;
-        } else {
-          voiceSelect.value = "__auto__";
-        }
+        tldSelect.value = items.gttsTld || "com";
+        slowCheckbox.checked = Boolean(items.gttsSlow);
 
         rateRange.value = items.ratePercent;
         volumeRange.value = items.volumePercent;
-        pitchRange.value = items.pitchHz;
         updateRangeLabels();
       }
     );
   }
 
   (async () => {
-    await loadVoiceList();
     populateLanguages();
+    populateTlds();
     attachListeners();
     restoreSettings();
   })();
 })();
-

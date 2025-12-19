@@ -1,15 +1,20 @@
 {
   "manifest_version": 3,
   "name": "Web TTS Helper",
-  "description": "朗读网页选中文本的轻量工具，选区旁浮动按钮一键朗读。",
-  "version": "0.1.0",
+  "description": "朗读网页选中文本的轻量工具，选区旁浮动按钮一键朗读（gTTS）。",
+  "version": "0.2.0",
   "permissions": [
     "activeTab",
     "storage"
   ],
   "host_permissions": [
-    "https://speech.platform.bing.com/*"
+    "https://translate.google.com/*",
+    "https://translate.google.com.hk/*",
+    "https://translate.google.cn/*"
   ],
+  "background": {
+    "service_worker": "src/background.js"
+  },
   "icons": {
     "16": "icons/icon-16.png",
     "48": "icons/icon-48.png",
