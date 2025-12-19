@@ -29,7 +29,7 @@ Web TTS Helper 是一个基于 Chrome/Edge Manifest V3 的轻量扩展：在网�
 
 1. 打开 `chrome://extensions`（Edge 同理）。
 2. 开启右上角“开发者模式”。
-3. 点击“加载已解压的扩展程序”，选择本项目根目录（包含 `manifest.json`）。
+3. 点击“加载未打包的扩展程序”，选择本项目根目录（包含 `manifest.json`）。
 4. 刷新任意页面后即可使用。
 
 ## 权限说明

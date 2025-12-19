@@ -3,9 +3,9 @@
 ## Project Structure & Module Organization
 
 - `manifest.json`: Chrome/Edge Manifest V3 configuration (permissions, content scripts, popup).
-- `src/content-script.js`: Core logic (selection detection, floating button in Shadow DOM, Edge TTS WebSocket session, word highlighting).
-- `src/popup.html` / `src/popup.js`: Action popup UI for voice/rate/volume/pitch settings (persisted via `chrome.storage.sync`).
-- `src/voice_list.tsv`: Voice catalog used for language/voice mapping.
+- `src/content-script.js`: Core logic (selection detection, floating button in Shadow DOM, gTTS playback, word highlighting).
+- `src/background.js`: gTTS synth requests (Google Translate) and MP3 data return.
+- `src/popup.html` / `src/popup.js`: Action popup UI for language/tld/slow/rate/volume settings (persisted via `chrome.storage.sync`).
 - `icons/`: Extension icons referenced by the manifest.
 
 ## Build, Test, and Development Commands
@@ -39,4 +39,4 @@ No automated tests currently. Validate manually:
 ## Security & Configuration Tips
 
 - Treat selected text as sensitive: avoid logging full content and minimize data retention.
-- Keep network access limited to the required Bing Speech endpoint and avoid broadening `host_permissions` without justification.
+- Keep network access limited to the required Google Translate endpoint and avoid broadening `host_permissions` without justification.
