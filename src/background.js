@@ -73,15 +73,30 @@
     const text = String(responseText || "");
     if (!text) return "";
 
-    const lines = text.split(/\r?\n/);
-    for (const line of lines) {
-      if (!line.includes(GOOGLE_TTS_RPC)) continue;
-      const match = line.match(/jQ1olc","\[\\"(.*?)\\"]/);
-      if (match && match[1]) return match[1];
+    if (!text.includes(GOOGLE_TTS_RPC)) return "";
+
+    // Prefer parsing the nested JSON string so that unicode escapes (e.g. \\u003d) are decoded properly.
+    try {
+      const match = text.match(new RegExp(`${GOOGLE_TTS_RPC}","([^"]+)"`));
+      const encodedPayload = match && match[1] ? match[1] : "";
+      if (encodedPayload) {
+        const decodedPayload = JSON.parse(`"${encodedPayload}"`); // e.g. `[\"<b64>\"]`
+        const innerJsonText = String(decodedPayload || "").replace(/\\"/g, '"');
+        const inner = JSON.parse(innerJsonText);
+        const base64 = Array.isArray(inner) ? inner[0] : "";
+        if (typeof base64 === "string" && base64) return base64;
+      }
+    } catch (_) {
+      // ignore
     }
 
-    const match = text.match(/jQ1olc","\[\\"(.*?)\\"]/);
-    return match && match[1] ? match[1] : "";
+    // Fallback regex: keep it broad, but only accept base64-ish characters.
+    const legacy = text.match(/jQ1olc","\[\\"(.*?)\\"/);
+    if (legacy && legacy[1]) {
+      const candidate = legacy[1].replace(/\\u003d/g, "=").replace(/\\u002b/g, "+").replace(/\\u002f/g, "/");
+      if (/^[A-Za-z0-9+/=]+$/.test(candidate)) return candidate;
+    }
+    return "";
   }
 
   function base64ToUint8Array(base64) {
@@ -89,6 +104,15 @@
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
     return bytes;
+  }
+
+  function uint8ArrayToBase64(bytes) {
+    const chunkSize = 0x8000;
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
   }
 
   function concatChunks(chunks) {
@@ -109,30 +133,105 @@
     if (!parts.length) throw new Error("No text to speak");
 
     const url = translateUrl(safeTld, "_/TranslateWebserverUi/data/batchexecute");
+    const referrer = translateUrl(safeTld, "");
     const base64Chunks = [];
 
     for (const part of parts) {
-      const body = packageRpc(part, safeLang, slow);
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded;charset=utf-8"
-        },
-        body,
-        credentials: "omit",
-        cache: "no-store",
-        signal
-      });
+      let audioBase64 = "";
+      let lastHead = "";
 
-      if (!response.ok) {
-        throw new Error(`gTTS request failed: HTTP ${response.status}`);
+      // Primary: gTTS batchexecute (same strategy as python gTTS).
+      {
+        const body = packageRpc(part, safeLang, slow);
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+            Accept: "*/*"
+          },
+          body,
+          credentials: "omit",
+          cache: "no-store",
+          referrer,
+          referrerPolicy: "no-referrer-when-downgrade",
+          signal
+        });
+
+        if (!response.ok) {
+          throw new Error(`gTTS request failed: HTTP ${response.status}`);
+        }
+
+        const contentType = response.headers.get("content-type") || "";
+        const textBody = await response.text();
+        audioBase64 = extractAudioBase64(textBody);
+        lastHead = `ct=${contentType || "?"} len=${textBody.length} rpc=${String(textBody || "").includes(GOOGLE_TTS_RPC)}`;
       }
 
-      const textBody = await response.text();
-      const audioBase64 = extractAudioBase64(textBody);
+      // Fallback: translate_tts endpoint (returns MP3 directly).
       if (!audioBase64) {
-        throw new Error("gTTS response missing audio");
+        const makeTtsUrl = (client) => {
+          const params = new URLSearchParams();
+          params.set("ie", "UTF-8");
+          params.set("client", client);
+          params.set("tl", safeLang);
+          params.set("q", part);
+          params.set("ttsspeed", slow ? "0.24" : "1");
+          params.set("total", "1");
+          params.set("idx", "0");
+          params.set("textlen", String(part.length));
+          params.set("prev", "input");
+          return translateUrl(safeTld, "translate_tts") + `?${params.toString()}`;
+        };
+
+        const fetchTts = async (client) => {
+          const ttsUrl = makeTtsUrl(client);
+          const response = await fetch(ttsUrl, {
+            method: "GET",
+            headers: { Accept: "*/*" },
+            credentials: "omit",
+            cache: "no-store",
+            referrer,
+            referrerPolicy: "no-referrer-when-downgrade",
+            signal
+          });
+          return { client, ttsUrl, response };
+        };
+
+        let attempt = await fetchTts("tw-ob");
+        if (!attempt.response.ok && (attempt.response.status === 400 || attempt.response.status === 403)) {
+          attempt = await fetchTts("gtx");
+        }
+
+        const response = attempt.response;
+
+        if (!response.ok) {
+          const contentType = response.headers.get("content-type") || "";
+          throw new Error(
+            `gTTS fallback request failed: HTTP ${response.status} (client=${attempt.client} tld=${safeTld} lang=${safeLang} ct=${contentType || "?"})`
+          );
+        }
+
+        const contentType = response.headers.get("content-type") || "";
+        if (/text\/html/i.test(contentType)) {
+          throw new Error(
+            `gTTS blocked (HTML response,可能被拦截/需要代理/切换域名) (client=${attempt.client} tld=${safeTld} lang=${safeLang} ct=${contentType})`
+          );
+        }
+
+        const mp3Bytes = new Uint8Array(await response.arrayBuffer());
+        audioBase64 = uint8ArrayToBase64(mp3Bytes);
       }
+
+      if (!audioBase64) {
+        const hint =
+          lastHead && /ct=text\/html/i.test(lastHead)
+            ? " (HTML response,可能被拦截/需要代理/切换域名)"
+            : "";
+        throw new Error(
+          `gTTS response missing audio (tld=${safeTld} lang=${safeLang}${hint}${lastHead ? `, ${lastHead}` : ""})`
+        );
+      }
+
       base64Chunks.push(audioBase64);
     }
 
